@@ -25,8 +25,11 @@
     SECTION 1 - Staging table changes:
                   Staging.K12StaffAssignment (YearsOfTotalExperience)
 
-    SECTION 2 - Fact table changes (new columns, defaults):
+    SECTION 2 - Fact table changes (new columns, nullability):
                   RDS.FactK12StaffAssignments (YearsOfTotalExperience)
+                  RDS.FactK12StaffEmployments (YearsOfPriorTeachingExperience,
+                    YearsOfPriorProfessionalExperience, YearsOfTotalExperience,
+                    YearsofPriorAdultEducationTeachingExperience)
 
     SECTION 3 - Descriptive metadata (extended properties) for the new columns
 
@@ -44,6 +47,19 @@
       RDS.FactK12StaffEmployments.YearsOfTotalExperience column.
       Sections 1, 2, 3 and 4.
 
+    * Staff experience measures are now NULLable.  The five years-of-experience
+      measures across RDS.FactK12StaffAssignments and RDS.FactK12StaffEmployments
+      are relaxed from NOT NULL to NULL, and any zero default constraint on them is
+      dropped.  These values are not reported by every source system, and 0 is a
+      legitimate measured value (a first-year staff member), so a zero default made
+      "not reported" and "no experience" permanently indistinguishable -- and
+      understated metrics such as average years of experience and percent
+      inexperienced.  Per Kimball, NULL is the correct representation of an
+      unmeasured fact: SUM, AVG, MIN, MAX and COUNT all ignore NULL measures, and
+      COUNT(<measure>) yields the reported-record count for free.  NULLs remain
+      forbidden in the dimension foreign keys, which continue to use the -1
+      "unknown member" convention.  Section 2.
+
     NOTES
     -----
     * Unlike the V14.0.0.0->V14.1.0.0 script, this script DOES apply column
@@ -53,10 +69,15 @@
       publish; the stored procedure is refreshed because the new fact column is
       inert until the staging-to-fact ETL carries it.  Both sections are
       idempotent and may be removed if the SSDT publish is preferred.
-    * Section 2 also converges the default constraint when the column already
-      exists without it (for example, if it was added by hand), so the script
-      reaches the documented target state from a partially-applied database as
-      well as from a clean V14.1.0.0 one.
+    * Section 2 converges the nullability and default constraints of the staff
+      experience measures, so the script reaches the documented target state from a
+      partially-applied database as well as from a clean V14.1.0.0 one.
+    * Section 2 does NOT convert existing zeros back to NULL.  Once a zero has been
+      written there is no way to tell a measured 0 (a first-year staff member) from
+      a zero-filled "not reported", so the script leaves stored values untouched
+      rather than guess.  If your source system can distinguish the two, reload the
+      affected rows from staging after upgrading; otherwise treat zeros loaded
+      before V14.2.0.0 as ambiguous.
 
     *** BACK UP YOUR DATABASE BEFORE RUNNING THIS SCRIPT ***
 */
@@ -101,23 +122,94 @@ PRINT N'';
 PRINT N'Section 2: Fact table changes...';
 
 -- 2a. RDS.FactK12StaffAssignments : Years of Total Experience (002060)
---     NOT NULL with a (0) default, matching the ETL's ISNULL(...,0) contract and the
---     existing RDS.FactK12StaffEmployments.YearsOfTotalExperience column.
+--     Added NULLable with no default.  Years of experience is not reported by every
+--     source system, and 0 is a legitimate measured value (a first-year staff
+--     member), so a zero default would make "not reported" and "no experience"
+--     indistinguishable.  NULL is the correct representation of an unmeasured fact;
+--     the SQL aggregates ignore it.
 PRINT N'  RDS.FactK12StaffAssignments -> YearsOfTotalExperience...';
 IF NOT EXISTS (SELECT 1 FROM sys.columns WHERE object_id = OBJECT_ID('RDS.FactK12StaffAssignments') AND name = 'YearsOfTotalExperience')
     ALTER TABLE [RDS].[FactK12StaffAssignments]
-        ADD [YearsOfTotalExperience] DECIMAL(4, 2) NOT NULL
-        CONSTRAINT [DF_FactK12StaffAssignments_YearsOfTotalExperience] DEFAULT ((0));
+        ADD [YearsOfTotalExperience] DECIMAL(4, 2) NULL;
 GO
 
--- Converge the default constraint if the column already exists without it.
-IF EXISTS (SELECT 1 FROM sys.columns WHERE object_id = OBJECT_ID('RDS.FactK12StaffAssignments') AND name = 'YearsOfTotalExperience')
-   AND NOT EXISTS (SELECT 1
-                   FROM sys.default_constraints dc
-                   JOIN sys.columns c ON c.object_id = dc.parent_object_id AND c.column_id = dc.parent_column_id
-                   WHERE dc.parent_object_id = OBJECT_ID('RDS.FactK12StaffAssignments') AND c.name = 'YearsOfTotalExperience')
-    ALTER TABLE [RDS].[FactK12StaffAssignments]
-        ADD CONSTRAINT [DF_FactK12StaffAssignments_YearsOfTotalExperience] DEFAULT ((0)) FOR [YearsOfTotalExperience];
+-- 2b. Converge every staff experience measure to "NULLable, no default".
+--     One block covers three starting points: a clean V14.1.0.0 database (where the
+--     four RDS.FactK12StaffEmployments measures are NOT NULL), a database that ran an
+--     earlier draft of this script (where FactK12StaffAssignments.YearsOfTotalExperience
+--     is NOT NULL with a (0) default), and a database already at the V14.2.0.0 target
+--     state (where this is a no-op).
+--
+--     The default constraint is dropped by its catalog name rather than by the expected
+--     name, so a hand-added or auto-named constraint is removed too.  Existing stored
+--     values are deliberately left alone -- see the NOTES header.
+PRINT N'  Staff experience measures -> NULLable, no default...';
+
+DECLARE @experienceMeasures TABLE (SchemaName SYSNAME, TableName SYSNAME, ColumnName SYSNAME);
+
+INSERT INTO @experienceMeasures (SchemaName, TableName, ColumnName)
+VALUES
+      (N'RDS', N'FactK12StaffAssignments', N'YearsOfTotalExperience')
+    , (N'RDS', N'FactK12StaffEmployments', N'YearsOfPriorTeachingExperience')
+    , (N'RDS', N'FactK12StaffEmployments', N'YearsOfPriorProfessionalExperience')
+    , (N'RDS', N'FactK12StaffEmployments', N'YearsOfTotalExperience')
+    , (N'RDS', N'FactK12StaffEmployments', N'YearsofPriorAdultEducationTeachingExperience');
+
+DECLARE @schemaName SYSNAME, @tableName SYSNAME, @columnName SYSNAME;
+DECLARE @objectId INT, @constraintName SYSNAME, @precision TINYINT, @scale TINYINT, @sql NVARCHAR(MAX);
+
+DECLARE experienceMeasures CURSOR LOCAL FAST_FORWARD FOR
+    SELECT SchemaName, TableName, ColumnName FROM @experienceMeasures;
+
+OPEN experienceMeasures;
+FETCH NEXT FROM experienceMeasures INTO @schemaName, @tableName, @columnName;
+
+WHILE @@FETCH_STATUS = 0
+BEGIN
+    SET @objectId = OBJECT_ID(QUOTENAME(@schemaName) + N'.' + QUOTENAME(@tableName), 'U');
+    SET @constraintName = NULL;
+
+    IF @objectId IS NOT NULL
+       AND EXISTS (SELECT 1 FROM sys.columns WHERE object_id = @objectId AND name = @columnName)
+    BEGIN
+        -- Drop any default constraint on the column.  A DEFAULT ((0)) would keep
+        -- zero-filling rows whose INSERT omits the column, defeating the NULL.
+        SELECT @constraintName = dc.name
+        FROM sys.default_constraints dc
+        JOIN sys.columns c
+          ON c.object_id = dc.parent_object_id
+         AND c.column_id = dc.parent_column_id
+        WHERE dc.parent_object_id = @objectId
+          AND c.name = @columnName;
+
+        IF @constraintName IS NOT NULL
+        BEGIN
+            SET @sql = N'ALTER TABLE ' + QUOTENAME(@schemaName) + N'.' + QUOTENAME(@tableName)
+                     + N' DROP CONSTRAINT ' + QUOTENAME(@constraintName) + N';';
+            PRINT N'    dropping default ' + QUOTENAME(@constraintName) + N' on ' + @tableName + N'.' + @columnName + N'...';
+            EXEC sys.sp_executesql @sql;
+        END
+
+        -- Relax to NULL, preserving the column's existing precision and scale.
+        IF EXISTS (SELECT 1 FROM sys.columns WHERE object_id = @objectId AND name = @columnName AND is_nullable = 0)
+        BEGIN
+            SELECT @precision = c.precision, @scale = c.scale
+            FROM sys.columns c
+            WHERE c.object_id = @objectId AND c.name = @columnName;
+
+            SET @sql = N'ALTER TABLE ' + QUOTENAME(@schemaName) + N'.' + QUOTENAME(@tableName)
+                     + N' ALTER COLUMN ' + QUOTENAME(@columnName)
+                     + N' DECIMAL(' + CAST(@precision AS NVARCHAR(10)) + N', ' + CAST(@scale AS NVARCHAR(10)) + N') NULL;';
+            PRINT N'    ' + @tableName + N'.' + @columnName + N' -> NULL';
+            EXEC sys.sp_executesql @sql;
+        END
+    END
+
+    FETCH NEXT FROM experienceMeasures INTO @schemaName, @tableName, @columnName;
+END
+
+CLOSE experienceMeasures;
+DEALLOCATE experienceMeasures;
 GO
 
 PRINT N'Section 2 complete.';
@@ -251,7 +343,7 @@ BEGIN
     , ISNULL(rdljc.[DimLeaJobClassificationId], -1)
     , ISNULL(rdsljc.[DimSeaJobClassificationId], -1)
     , ISNULL(ska.[FullTimeEquivalency], 0)
-    , ISNULL(ska.[YearsOfTotalExperience], 0)
+    , ska.[YearsOfTotalExperience]
     , 1
   FROM Staging.K12StaffAssignment ska
   JOIN RDS.DimSchoolYears rsy

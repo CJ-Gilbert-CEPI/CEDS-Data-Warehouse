@@ -62,7 +62,7 @@ BEGIN
     , ISNULL(rdljc.[DimLeaJobClassificationId], -1)
     , ISNULL(rdsljc.[DimSeaJobClassificationId], -1)
     , ISNULL(ska.[FullTimeEquivalency], 0)
-    , ISNULL(ska.[YearsOfTotalExperience], 0)
+    , ska.[YearsOfTotalExperience]
     , 1
   FROM Staging.K12StaffAssignment ska
   JOIN RDS.DimSchoolYears rsy
